@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest'
-import { parseCsv, isValidEmail } from './csvParser'
+import { parseCsv, isValidEmail } from '../src/utils/csvParser'
+import leadsWithErrors from '../../docs/leads-with-errors.csv?raw'
+import leadsOk1 from '../../docs/leads-ok-1.csv?raw'
+import leadsOk2 from '../../docs/leads-ok-2.csv?raw'
+import leadsOk3 from '../../docs/leads-ok-3.csv?raw'
 
 describe('isValidEmail', () => {
   it('should return true for valid email addresses', () => {
@@ -21,6 +25,56 @@ describe('isValidEmail', () => {
 })
 
 describe('parseCsv', () => {
+  it('rejects the invalid countries from the real CSV without corrupting accents', () => {
+    const leads = parseCsv(leadsWithErrors)
+
+    for (const rowIndex of [6, 11, 14, 16, 18]) {
+      const lead = leads.find((lead) => lead.rowIndex === rowIndex)!
+      expect(lead.isValid, `CSV row ${rowIndex}`).toBe(false)
+      expect(lead.errors).toContain('Country code must be two uppercase letters')
+    }
+    expect(leads[0]).toMatchObject({
+      firstName: 'Iñaki',
+      lastName: 'Álvarez',
+      countryCode: 'ES',
+      isValid: true,
+      errors: [],
+    })
+  })
+
+  it.each([leadsOk1, leadsOk2, leadsOk3])('preserves every valid example country', (csv) => {
+    const leads = parseCsv(csv)
+    const originalCodes = csv
+      .trim()
+      .split(/\r?\n/)
+      .slice(1)
+      .map((row) => row.match(/,([A-Z]{2}),/)![1])
+    expect(leads.every((lead) => lead.isValid)).toBe(true)
+    expect(leads.map((lead) => lead.countryCode)).toEqual(originalCodes)
+  })
+
+  it('keeps countries optional and preserves accented fields when trimming', () => {
+    const leads = parseCsv(`firstName,lastName,email,jobTitle,countryCode,companyName
+ Iñaki , Álvarez ,inaki@example.com, Técnico , ES , Compañía Ñ
+Zoé,Muñoz,zoe@example.com,Diseñadora,,Éxito`)
+    expect(leads[0]).toMatchObject({
+      firstName: 'Iñaki',
+      lastName: 'Álvarez',
+      jobTitle: 'Técnico',
+      countryCode: 'ES',
+      companyName: 'Compañía Ñ',
+      isValid: true,
+    })
+    expect(leads[1]).toMatchObject({
+      firstName: 'Zoé',
+      lastName: 'Muñoz',
+      jobTitle: 'Diseñadora',
+      countryCode: undefined,
+      companyName: 'Éxito',
+      isValid: true,
+    })
+  })
+
   it('should throw error for empty content', () => {
     expect(() => parseCsv('')).toThrow('CSV content cannot be empty')
     expect(() => parseCsv('   ')).toThrow('CSV content cannot be empty')
@@ -222,5 +276,58 @@ Jane,Johnson,jane@example.com`
     expect(result[0].lastName).toBe('Doe')
     expect(result[0].email).toBe('john@example.com')
     expect(result[0].isValid).toBe(true)
+  })
+})
+
+describe('new optional fields', () => {
+  it('parses present, absent and zero values without converting phones to numbers', () => {
+    const rows = parseCsv(`firstName,lastName,email,phoneNumber,yearsAtCompany,linkedinUrl
+Ana,Test,ana@example.com,+34 612 345 678,5,https://linkedin.com/in/ana
+Luis,Test,luis@example.com,,,
+Zoe,Test,zoe@example.com,0034 612 345 678,0,https://linkedin.com/in/zoe`)
+    expect(rows.every((row) => row.isValid)).toBe(true)
+    expect(rows[0]).toMatchObject({
+      phoneNumber: '+34 612 345 678',
+      yearsAtCompany: 5,
+      linkedinUrl: 'https://linkedin.com/in/ana',
+    })
+    expect(rows[1].yearsAtCompany).toBeUndefined()
+    expect(rows[1].phoneNumber).toBeUndefined()
+    expect(rows[2]).toMatchObject({ phoneNumber: '0034 612 345 678', yearsAtCompany: 0 })
+  })
+  it('does not map yearsInRole to yearsAtCompany', () => {
+    const [row] = parseCsv('firstName,lastName,email,yearsInRole\nAna,Test,ana@example.com,8')
+    expect(row.isValid).toBe(true)
+    expect(row.yearsAtCompany).toBeUndefined()
+  })
+  it.each(['-1', '1.5', 'NaN', '1e2', '0x10', '2147483648'])('rejects invalid CSV years: %s', (years) => {
+    expect(
+      parseCsv(`firstName,lastName,email,yearsAtCompany\nAna,Test,ana@example.com,${years}`)[0].isValid
+    ).toBe(false)
+  })
+  it('flags invalid phone and LinkedIn values before importing', () => {
+    const [row] = parseCsv(
+      'firstName,lastName,email,phoneNumber,linkedinUrl\nAna,Test,ana@example.com,call me,https://linkedin.com.evil.test/in/ana'
+    )
+    expect(row.errors).toEqual([
+      'Invalid phone number format',
+      'LinkedIn URL must be an HTTP(S) LinkedIn profile URL',
+    ])
+  })
+})
+
+describe('company website for phone enrichment', () => {
+  it('normalizes an explicitly supplied website and never infers it from the company or email', () => {
+    const rows = parseCsv(`firstName,lastName,email,companyName,companyWebsite
+Ada,Test,ada@example.com,Example,https://www.example.com/about
+Grace,Test,grace@company.com,Company,`)
+    expect(rows[0]).toMatchObject({ companyWebsite: 'www.example.com', isValid: true })
+    expect(rows[1].companyWebsite).toBeUndefined()
+    expect(rows[1].isValid).toBe(true)
+  })
+  it('flags invalid website input', () => {
+    const [row] = parseCsv('firstName,lastName,email,companyWebsite\nAda,Test,ada@example.com,Example Company')
+    expect(row.isValid).toBe(false)
+    expect(row.errors).toContain('Company website must be a valid domain or HTTP(S) website URL')
   })
 })

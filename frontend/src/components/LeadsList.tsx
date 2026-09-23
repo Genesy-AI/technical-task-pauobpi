@@ -4,6 +4,9 @@ import toast from 'react-hot-toast'
 import { api } from '../api'
 import { MessageTemplateModal } from './MessageTemplateModal'
 import { CsvImportModal } from './CsvImportModal'
+import { PhoneSearchStatus } from './PhoneSearchStatus'
+import { usePhoneEnrichment } from '../hooks/usePhoneEnrichment'
+import { isPhoneSearchActive } from '../../../shared/phoneEnrichment'
 
 export const LeadsList: FC = () => {
   const [selectedLeads, setSelectedLeads] = useState<number[]>([])
@@ -18,6 +21,15 @@ export const LeadsList: FC = () => {
     retry: false,
   })
   
+
+  const phone = usePhoneEnrichment(leads.data?.map(lead => lead.id) || [])
+  const phoneById = new Map(phone.progress.data?.map(lead => [lead.id, lead]))
+  const activePhoneCount = phone.progress.data?.filter(lead => isPhoneSearchActive(lead.phoneEnrichmentStatus)).length || 0
+  const selectedPhoneActive = selectedLeads.some(id => isPhoneSearchActive(phoneById.get(id)?.phoneEnrichmentStatus))
+  const selectedWithoutPhone = selectedLeads.some(id => {
+    const saved = phoneById.get(id) || leads.data?.find(lead => lead.id === id)
+    return saved && !saved.phoneNumber
+  })
 
   const deleteLeadsMutation = useMutation({
     mutationFn: async (ids: number[]) => api.leads.deleteMany({ ids }),
@@ -37,18 +49,21 @@ export const LeadsList: FC = () => {
 
   const verifyEmailsMutation = useMutation({
     mutationFn: async (ids: number[]) => api.leads.verifyEmails({ leadIds: ids }),
+    retry: false,
+    onMutate: () => setIsEnrichDropdownOpen(false),
     onSuccess: (data) => {
-      queryClient.invalidateQueries({ queryKey: ['leads', 'getMany'] })
-      setIsEnrichDropdownOpen(false)
-      toast.success(
-        data.verifiedCount === 1
-          ? `Verified ${data.verifiedCount} email`
-          : `Verified ${data.verifiedCount} emails`
-      )
+      const valid = data.results.filter(result => result.emailVerified).length
+      const invalid = data.results.filter(result => !result.emailVerified).length
+      const message = `${valid} valid, ${invalid} invalid, ${data.errors.length} technical failures`
+      if (data.errors.length) toast.error(message)
+      else toast.success(message)
     },
     onError: () => {
-      toast.error('Failed to verify emails. Please try again.')
-    }
+      toast.error('Verification could not complete. Please retry.')
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ['leads', 'getMany'] })
+    },
   })
 
   const handleSelectAll = (checked: boolean) => {
@@ -118,7 +133,7 @@ export const LeadsList: FC = () => {
             <div className="relative">
               <button
                 onClick={() => selectedLeads.length > 0 && setIsEnrichDropdownOpen(!isEnrichDropdownOpen)}
-                disabled={selectedLeads.length === 0}
+                disabled={selectedLeads.length === 0 || verifyEmailsMutation.isPending}
                 className="inline-flex items-center px-3 py-2 border border-gray-300 text-sm leading-4 font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
                 <svg className="-ml-1 mr-2 h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -148,7 +163,10 @@ export const LeadsList: FC = () => {
                       </div>
                     </button>
                     <button
-                      onClick={() => verifyEmailsMutation.mutate(selectedLeads)}
+                      onClick={() => {
+                        if (!verifyEmailsMutation.isPending) verifyEmailsMutation.mutate(selectedLeads)
+                      }}
+                      disabled={verifyEmailsMutation.isPending}
                       className="block w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 transition-colors"
                     >
                       <div className="flex items-center">
@@ -157,6 +175,16 @@ export const LeadsList: FC = () => {
                         </svg>
                         Verify Email
                       </div>
+                    </button>
+                    <button
+                      onClick={() => {
+                        setIsEnrichDropdownOpen(false)
+                        phone.start.mutate(selectedLeads)
+                      }}
+                      disabled={phone.start.isPending || selectedPhoneActive || !selectedWithoutPhone || phone.progress.isError || phone.progress.isLoading}
+                      className="block w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    >
+                      Find phone
                     </button>
                     <button
                       onClick={() => {
@@ -179,7 +207,7 @@ export const LeadsList: FC = () => {
 
             <button
               onClick={handleDeleteSelected}
-              disabled={selectedLeads.length === 0 || deleteLeadsMutation.isPending}
+              disabled={selectedLeads.length === 0 || deleteLeadsMutation.isPending || verifyEmailsMutation.isPending || phone.start.isPending || selectedPhoneActive}
               className="inline-flex items-center px-3 py-2 border border-transparent text-sm leading-4 font-medium rounded-md text-white bg-red-600 hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
               {deleteLeadsMutation.isPending ? (
@@ -203,6 +231,35 @@ export const LeadsList: FC = () => {
         </div>
       </div>
 
+      {verifyEmailsMutation.isPending && (
+        <p role="status" className="px-6 py-3 text-sm text-blue-700">
+          Verifying {verifyEmailsMutation.variables?.length} emails…
+        </p>
+      )}
+      {verifyEmailsMutation.data && verifyEmailsMutation.data.errors.length > 0 && (
+        <p role="alert" className="px-6 py-3 text-sm text-red-700">
+          {verifyEmailsMutation.data.verifiedCount} checked; {verifyEmailsMutation.data.errors.length} technical failures:
+          {' '}{verifyEmailsMutation.data.errors.map(error => error.leadName).join(', ')}.
+          {' '}These emails could not be verified. Please retry.
+        </p>
+      )}
+      {verifyEmailsMutation.isError && (
+        <p role="alert" className="px-6 py-3 text-sm text-red-700">
+          Verification could not complete. Some results may have been saved. Please retry.
+        </p>
+      )}
+
+      {(phone.start.isPending || activePhoneCount > 0) && (
+        <p role="status" className="px-6 py-3 text-sm text-blue-700">
+          {phone.start.isPending ? 'Starting phone searches…' : `${activePhoneCount} phone searches in progress. You can reload this page.`}
+        </p>
+      )}
+      {phone.progress.isError && (
+        <p role="alert" className="px-6 py-3 text-sm text-red-700">
+          Phone progress is temporarily unavailable. Existing phones are preserved.
+          <button onClick={() => phone.progress.refetch()} className="ml-2 underline">Retry status</button>
+        </p>
+      )}
       <div className="flex-1 overflow-hidden">
         <div className="h-full overflow-auto">
           <table className="min-w-full divide-y divide-gray-200">
@@ -232,7 +289,19 @@ export const LeadsList: FC = () => {
                   Company
                 </th>
                 <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider bg-gray-50">
+                  Company website
+                </th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider bg-gray-50">
                   Country
+                </th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider bg-gray-50">
+                  Phone number
+                </th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider bg-gray-50">
+                  Years at company
+                </th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider bg-gray-50">
+                  LinkedIn
                 </th>
                 <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider bg-gray-50">
                   Message
@@ -264,7 +333,15 @@ export const LeadsList: FC = () => {
                     </div>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap">
-                    <div className="text-sm text-gray-900">{lead.email || '-'} {lead.emailVerified === null ? '❓' : lead.emailVerified ? '✅' : '❌'}</div>
+                    <div className="text-sm text-gray-900">
+                      {lead.email || '-'}{' '}
+                      {verifyEmailsMutation.isPending && verifyEmailsMutation.variables?.includes(lead.id)
+                        ? 'Verifying…'
+                        : verifyEmailsMutation.data?.errors.some(error => error.leadId === lead.id) ||
+                            (verifyEmailsMutation.isError && verifyEmailsMutation.variables?.includes(lead.id))
+                          ? '⚠ Verification failed'
+                          : lead.emailVerified === null ? '❓ Not verified' : lead.emailVerified ? '✅ Valid' : '❌ Invalid'}
+                    </div>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap">
                     <div className="text-sm text-gray-900">{lead.jobTitle || '-'}</div>
@@ -273,7 +350,22 @@ export const LeadsList: FC = () => {
                     <div className="text-sm text-gray-900">{lead.companyName || '-'}</div>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap">
+                    <div className="text-sm text-gray-900">{lead.companyWebsite ?? '-'}</div>
+                  </td>
+                  <td className="px-6 py-4 whitespace-nowrap">
                     <div className="text-sm text-gray-900">{lead.countryCode || '-'}</div>
+                  </td>
+                  <td className="px-6 py-4 whitespace-nowrap">
+                    <div className="text-sm text-gray-900">{phoneById.get(lead.id)?.phoneNumber ?? lead.phoneNumber ?? '-'}</div>
+                    <PhoneSearchStatus progress={phoneById.get(lead.id)} />
+                  </td>
+                  <td className="px-6 py-4 whitespace-nowrap">
+                    <div className="text-sm text-gray-900">{lead.yearsAtCompany ?? '-'}</div>
+                  </td>
+                  <td className="px-6 py-4">
+                    <div className="text-sm text-gray-900 max-w-xs truncate" title={lead.linkedinUrl ?? ''}>
+                      {lead.linkedinUrl ?? '-'}
+                    </div>
                   </td>
                   <td className="px-6 py-4">
                     <div className="text-sm text-gray-900 max-w-xs truncate" title={lead.message || ''}>

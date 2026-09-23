@@ -1,17 +1,18 @@
-import { PrismaClient } from '@prisma/client'
+import { prisma } from './db'
+import { registerPhoneRoutes } from './phone/routes'
 import express, { Request, Response } from 'express'
 import { Connection, Client } from '@temporalio/client'
 import { verifyEmailWorkflow } from './workflows'
 import { generateMessageFromTemplate } from './utils/messageGenerator'
 import { runTemporalWorker } from './worker'
-const prisma = new PrismaClient()
+import { validateLeadFields, OptionalLeadFields } from './utils/leadFields'
 const app = express()
 app.use(express.json())
 
 app.use(function (req, res, next) {
   res.header('Access-Control-Allow-Origin', '*')
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept')
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS')
 
   if (req.method === 'OPTIONS') {
     res.sendStatus(200)
@@ -22,7 +23,13 @@ app.use(function (req, res, next) {
 })
 
 app.post('/leads', async (req: Request, res: Response) => {
-  const { name, lastName, email } = req.body
+  const { firstName, name = firstName, lastName, email } = req.body || {}
+  let fields: OptionalLeadFields
+  try {
+    fields = validateLeadFields(req.body || {})
+  } catch (error) {
+    return res.status(400).json({ error: (error as Error).message })
+  }
 
   if (!name || !lastName || !email) {
     return res.status(400).json({ error: 'firstName, lastName, and email are required' })
@@ -30,6 +37,7 @@ app.post('/leads', async (req: Request, res: Response) => {
 
   const lead = await prisma.lead.create({
     data: {
+      ...fields,
       firstName: String(name),
       lastName: String(lastName),
       email: String(email),
@@ -37,6 +45,8 @@ app.post('/leads', async (req: Request, res: Response) => {
   })
   res.json(lead)
 })
+
+registerPhoneRoutes(app)
 
 app.get('/leads/:id', async (req: Request, res: Response) => {
   const { id } = req.params
@@ -56,14 +66,21 @@ app.get('/leads', async (req: Request, res: Response) => {
 
 app.patch('/leads/:id', async (req: Request, res: Response) => {
   const { id } = req.params
-  const { name, email } = req.body
+  const { firstName, name = firstName, email } = req.body || {}
+  let fields: OptionalLeadFields
+  try {
+    fields = validateLeadFields(req.body || {})
+  } catch (error) {
+    return res.status(400).json({ error: (error as Error).message })
+  }
   const lead = await prisma.lead.update({
     where: {
       id: Number(id),
     },
     data: {
-      firstName: String(name),
-      email: String(email),
+      ...fields,
+      firstName: name === undefined ? undefined : String(name),
+      email: email === undefined ? undefined : String(email),
     },
   })
   res.json(lead)
@@ -181,6 +198,7 @@ app.post('/leads/bulk', async (req: Request, res: Response) => {
   try {
     const validLeads = leads.filter((lead) => {
       return (
+        lead &&
         lead.firstName &&
         lead.lastName &&
         lead.email &&
@@ -223,6 +241,7 @@ app.post('/leads/bulk', async (req: Request, res: Response) => {
       try {
         await prisma.lead.create({
           data: {
+            ...validateLeadFields(lead),
             firstName: lead.firstName.trim(),
             lastName: lead.lastName.trim(),
             email: lead.email.trim(),
@@ -264,6 +283,7 @@ app.post('/leads/verify-emails', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'leadIds must be a non-empty array' })
   }
 
+  let connection: Connection | undefined
   try {
     const leads = await prisma.lead.findMany({
       where: { id: { in: leadIds.map((id) => Number(id)) } },
@@ -273,48 +293,55 @@ app.post('/leads/verify-emails', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'No leads found with the provided IDs' })
     }
 
-    const connection = await Connection.connect({ address: 'localhost:7233' })
+    connection = await Connection.connect({ address: 'localhost:7233', connectTimeout: '3 seconds' })
     const client = new Client({ connection, namespace: 'default' })
 
     let verifiedCount = 0
     const results: Array<{ leadId: number; emailVerified: boolean }> = []
     const errors: Array<{ leadId: number; leadName: string; error: string }> = []
 
-    for (const lead of leads) {
-      try {
-        const isVerified = await client.workflow.execute(verifyEmailWorkflow, {
-          taskQueue: 'myQueue',
-          workflowId: `verify-email-${lead.id}-${Date.now()}`,
-          args: [lead.email],
-        })
+    await Promise.all(
+      leads.map(async (lead) => {
+        try {
+          const isVerified = await connection!.withDeadline(Date.now() + 20_000, () =>
+            client.workflow.execute(verifyEmailWorkflow, {
+              taskQueue: process.env.TASK_QUEUE || 'myQueue',
+              workflowId: `verify-email-${lead.id}`,
+              workflowIdConflictPolicy: 'USE_EXISTING',
+              workflowExecutionTimeout: '15 seconds',
+              args: [lead.email],
+            })
+          )
 
-        await prisma.lead.update({
-          where: { id: lead.id },
-          data: { emailVerified: Boolean(isVerified) },
-        })
+          await prisma.lead.update({
+            where: { id: lead.id },
+            data: { emailVerified: isVerified },
+          })
 
-        results.push({ leadId: lead.id, emailVerified: isVerified })
-        verifiedCount += 1
-      } catch (error) {
-        errors.push({
-          leadId: lead.id,
-          leadName: `${lead.firstName} ${lead.lastName}`.trim(),
-          error: error instanceof Error ? error.message : 'Unknown error',
-        })
-      }
-    }
+          results.push({ leadId: lead.id, emailVerified: isVerified })
+          verifiedCount += 1
+        } catch {
+          errors.push({
+            leadId: lead.id,
+            leadName: `${lead.firstName} ${lead.lastName}`.trim(),
+            error: 'Verification failed or timed out. Please retry.',
+          })
+        }
+      })
+    )
 
-    await connection.close()
-
-    res.json({ success: true, verifiedCount, results, errors })
+    res.json({ success: errors.length === 0, verifiedCount, results, errors })
   } catch (error) {
     console.error('Error verifying emails:', error)
     res.status(500).json({ error: 'Failed to verify emails' })
+  } finally {
+    await connection?.close()
   }
 })
 
-app.listen(4000, () => {
-  console.log('Express server is running on port 4000')
+const port = Number(process.env.PORT || 4000)
+app.listen(port, () => {
+  console.log(`Express server is running on port ${port}`)
 })
 
 runTemporalWorker().catch((err) => {

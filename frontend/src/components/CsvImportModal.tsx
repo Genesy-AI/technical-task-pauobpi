@@ -55,10 +55,10 @@ export const CsvImportModal: FC<CsvImportModalProps> = ({ isOpen, onClose }) => 
         const content = e.target?.result as string
         const parsed = parseCsv(content)
         setCsvData(parsed)
-        setIsProcessing(false)
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Failed to parse CSV file'
         toast.error(errorMessage)
+      } finally {
         setIsProcessing(false)
       }
     }
@@ -100,6 +100,10 @@ export const CsvImportModal: FC<CsvImportModalProps> = ({ isOpen, onClose }) => 
         jobTitle: lead.jobTitle || undefined,
         countryCode: lead.countryCode || undefined,
         companyName: lead.companyName || undefined,
+        companyWebsite: lead.companyWebsite,
+        phoneNumber: lead.phoneNumber,
+        yearsAtCompany: lead.yearsAtCompany,
+        linkedinUrl: lead.linkedinUrl,
       }))
 
       return api.leads.bulkImport({ leads: leadsToImport })
@@ -115,7 +119,11 @@ export const CsvImportModal: FC<CsvImportModalProps> = ({ isOpen, onClose }) => 
         message += ` (${data.invalidLeads} invalid leads excluded)`
       }
 
-      toast.success(message)
+      if (data.errors.length > 0) {
+        toast.error(`${message} ${data.errors.length} failed: ${data.errors.map(item => item.error).join('; ')}`)
+      } else {
+        toast.success(message)
+      }
       onClose()
       setCsvData([])
     },
@@ -238,7 +246,7 @@ export const CsvImportModal: FC<CsvImportModalProps> = ({ isOpen, onClose }) => 
                   </p>
                   <p className="text-sm text-gray-500">
                     CSV must include: firstName, lastName, email (required). Optional: jobTitle, countryCode,
-                    companyName
+                    companyName, companyWebsite, phoneNumber, yearsAtCompany, linkedinUrl. Years at company is distinct from years in role.
                   </p>
                 </div>
               )}
@@ -285,6 +293,18 @@ export const CsvImportModal: FC<CsvImportModalProps> = ({ isOpen, onClose }) => 
                         Company
                       </th>
                       <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">
+                        Company website
+                      </th>
+                      <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">
+                        Phone number
+                      </th>
+                      <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">
+                        Years at company
+                      </th>
+                      <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">
+                        LinkedIn
+                      </th>
+                      <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">
                         Errors
                       </th>
                     </tr>
@@ -309,6 +329,10 @@ export const CsvImportModal: FC<CsvImportModalProps> = ({ isOpen, onClose }) => 
                         </td>
                         <td className="px-3 py-2 text-sm text-gray-900">{lead.email || '-'}</td>
                         <td className="px-3 py-2 text-sm text-gray-900">{lead.companyName || '-'}</td>
+                        <td className="px-3 py-2 text-sm text-gray-900">{lead.companyWebsite ?? '-'}</td>
+                        <td className="px-3 py-2 text-sm text-gray-900">{lead.phoneNumber ?? '-'}</td>
+                        <td className="px-3 py-2 text-sm text-gray-900">{lead.yearsAtCompany ?? '-'}</td>
+                        <td className="px-3 py-2 text-sm text-gray-900">{lead.linkedinUrl ?? '-'}</td>
                         <td className="px-3 py-2 text-sm text-red-600">{lead.errors.join(', ') || '-'}</td>
                       </tr>
                     ))}
